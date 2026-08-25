@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from packaging.version import parse as version_parse
-
 from homeassistant.components.button import (
     ButtonDeviceClass,
     ButtonEntity,
@@ -22,6 +20,7 @@ from .__init__ import ESPSomfyRTSEntityFeature
 from .const import API_REBOOT, DOMAIN, EVT_CONNECTED
 from .controller import ESPSomfyController
 from .entity import ESPSomfyEntity
+from .helpers import parse_firmware_version
 
 SVC_REBOOT = "reboot"
 SVC_BACKUP = "backup"
@@ -52,7 +51,7 @@ async def async_setup_entry(
     """Set up ESPSomfy RTS update based on a config entry."""
     new_entities = []
     controller: ESPSomfyController = hass.data[DOMAIN][config_entry.entry_id]
-    v = version_parse(controller.version)
+    v = parse_firmware_version(controller.version)
     if v.major >= 2 and v.minor >= 3 and v.micro >= 0:
         new_entities.append(
             ESPSomfyButton(

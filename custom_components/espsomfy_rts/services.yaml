@@ -75,8 +75,10 @@ set_tilt_position:
           unit_of_measurement: "%"
 
 set_current_position:
-  name: Change Position
-  description: Sets the current position without moving the motor
+  name: Calibrate position (no move)
+  description: >
+    Tell the controller where the shade really is (0% = closed, 100% = open)
+    without moving the motor. Use when HA shows closed but the curtain is open.
   target:
     entity:
       integration: espsomfy_rts
@@ -84,13 +86,14 @@ set_current_position:
   fields:
     position:
       name: Position
-      description: The position to be set
+      description: Reported position (100 = fully open, 0 = fully closed)
       required: true
       selector:
         number:
           min: 0
           max: 100
           unit_of_measurement: "%"
+          mode: slider
 
 set_current_tilt_position:
   name: Change Tilt Position
@@ -221,8 +224,6 @@ reboot:
     entity:
       integration: espsomfy_rts
       domain: button
-      supported_features:
-        - fan.FanEntityFeature.SET_SPEED
 
 backup:
   name: Backup
@@ -231,8 +232,60 @@ backup:
     entity:
       integration: espsomfy_rts
       domain: button
-      supported_features:
-        - fan.FanEntityFeature.OSCILLATE
 
+apply_scene:
+  name: Apply scene
+  description: Run a named scene stored on the ESPSomfy controller
+  fields:
+    scene_id:
+      name: Scene ID
+      description: Scene number (1–8) as shown on the controller Home screen
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 8
+          mode: box
+    host:
+      name: Host
+      description: Controller hostname or IP (required when more than one hub is configured)
+      required: false
+      selector:
+        text:
+
+room_command:
+  name: Room command
+  description: >
+    Open, close, My, or stop every shade in a room (queued on the ESP).
+    Use open/close for HA semantics (awning rooms are swapped); up/down are literal RF.
+  fields:
+    room_id:
+      name: Room ID
+      description: Room number from the controller (0 = all rooms)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 24
+          mode: box
+    command:
+      name: Command
+      required: true
+      selector:
+        select:
+          options:
+            - "open"
+            - "close"
+            - "up"
+            - "my"
+            - "down"
+            - "stop"
+          mode: dropdown
+    host:
+      name: Host
+      description: Controller hostname or IP (required when more than one hub is configured)
+      required: false
+      selector:
+        text:
 
 

@@ -46,6 +46,33 @@
       }
     }
   },
+  "entity": {
+    "switch": {
+      "invert_direction": {
+        "name": "Invertir dirección"
+      },
+      "invert_position": {
+        "name": "Invertir lectura %"
+      },
+      "invert_on_off": {
+        "name": "Invertir ON/OFF"
+      },
+      "single_button_remote": {
+        "name": "Mando de un botón"
+      }
+    },
+    "number": {
+      "open_travel_time": {
+        "name": "Tiempo de apertura"
+      },
+      "close_travel_time": {
+        "name": "Tiempo de cierre"
+      },
+      "calibrate_position": {
+        "name": "Calibrar posición (100%=abierto)"
+      }
+    }
+  },
   "options": {
     "error": {
       "cannot_connect": "Fallo al conectar",
@@ -62,10 +89,39 @@
           "host": "Dirección de Host para el dispositivo ESPSomfy RTS",
           "username": "Usuario",
           "password": "Password",
-          "pin": "Pin"
+          "pin": "Pin",
+          "control_mode": "Controles de cover"
+        },
+        "data_description": {
+          "control_mode": "Siempre habilitado mantiene Abrir/Cerrar/Parar clicables. Seguir estado desactiva botones según abierto, cerrado o en movimiento."
         },
         "title": "Configura ESPSomfy RTS",
         "description": "Proporciona las opciones de seguridad configuradas para tu dispositivo"
+      }
+    }
+  },
+  "selector": {
+    "control_mode": {
+      "options": {
+        "always": "Siempre habilitar controles",
+        "follow_status": "Seguir estado del cover"
+      }
+    }
+  },
+  "services": {
+    "apply_scene": {
+      "name": "Aplicar escena",
+      "description": "Ejecutar una escena guardada en el controlador ESPSomfy",
+      "fields": {
+        "scene_id": { "name": "ID de escena", "description": "Número de escena (1–8)" }
+      }
+    },
+    "room_command": {
+      "name": "Comando de habitación",
+      "description": "Abrir, cerrar, My o parar todas las cortinas de una habitación",
+      "fields": {
+        "room_id": { "name": "ID de habitación", "description": "Número de habitación (0 = todas)" },
+        "command": { "name": "Comando", "description": "up, my, down o stop" }
       }
     }
   }

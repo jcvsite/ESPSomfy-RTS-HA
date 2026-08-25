@@ -57,6 +57,8 @@ async def async_setup_entry(
 class ESPSomfySunSensor(ESPSomfyEntity, BinarySensorEntity):
     """A sun flag sensor indicating whether there is sun."""
 
+    _entity_id_suffix = "sun"
+
     def __init__(self, controller: ESPSomfyController, data) -> None:
         """Initialize a new SunSensor."""
         super().__init__(controller=controller, data=data)
@@ -73,7 +75,7 @@ class ESPSomfySunSensor(ESPSomfyEntity, BinarySensorEntity):
             self._shade_id = data["shadeId"]
             self._attr_unique_id = f"sun_{controller.unique_id}_{self._shade_id}"
             self._sensor_type = "motor"
-        self._attr_name = data["name"]
+        self._attr_name = controller.api.format_entity_name(data)
         self._attr_has_entity_name = False
         if "flags" in data:
             self._attr_is_on = bool((int(data["flags"]) & 0x20) == 0x20)
@@ -126,6 +128,8 @@ class ESPSomfySunSensor(ESPSomfyEntity, BinarySensorEntity):
 class ESPSomfyWindSensor(ESPSomfyEntity, BinarySensorEntity):
     """A sun flag sensor indicating whether there is sun."""
 
+    _entity_id_suffix = "wind"
+
     def __init__(self, controller: ESPSomfyController, data) -> None:
         """Initialize a new SunSensor."""
         super().__init__(controller=controller, data=data)
@@ -142,7 +146,7 @@ class ESPSomfyWindSensor(ESPSomfyEntity, BinarySensorEntity):
             self._shade_id = data["shadeId"]
             self._attr_unique_id = f"wind_{controller.unique_id}_{self._shade_id}"
             self._sensor_type = "motor"
-        self._attr_name = data["name"]
+        self._attr_name = controller.api.format_entity_name(data)
         self._attr_has_entity_name = False
         if "flags" in data:
             self._attr_is_on = bool((int(data["flags"]) & 0x10) == 0x10)

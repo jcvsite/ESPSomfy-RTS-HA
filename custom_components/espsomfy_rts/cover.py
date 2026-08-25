@@ -33,6 +33,14 @@ from .const import (
 )
 from .controller import ESPSomfyController
 from .entity import ESPSomfyEntity
+from .helpers import as_bool, controls_always_enabled, room_rf_command, room_shades
+from .shade_visuals import (
+    esp_position_from_ha,
+    ha_position_from_esp,
+    shade_entity_picture,
+    shade_mdi_icon,
+    visual_openness_from_esp,
+)
 
 SVC_OPEN_SHADE = "open_shade"
 SVC_CLOSE_SHADE = "close_shade"
@@ -139,6 +147,16 @@ async def async_setup_entry(
         if new_groups:
             async_add_entities(new_groups)
 
+        new_rooms = []
+        for room in controller.api.rooms:
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                rid = int(room.get("roomId") or 0)
+                if not rid:
+                    continue
+                new_rooms.append(ESPSomfyRoom(controller=controller, data=room))
+        if new_rooms:
+            async_add_entities(new_rooms)
+
         platform = ep.async_get_current_platform()
         platform.async_register_entity_service(
             SVC_SET_SHADE_POS,
@@ -196,29 +214,31 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
         self._controller = controller
         self._group_id = data["groupId"]
         self._attr_device_class = CoverDeviceClass.SHADE
+        entry = hass.config_entries.async_get_entry(controller.config_entry_id)
+        self._attr_assumed_state = controls_always_enabled(entry)
         self._linked_shade_ids = []
+        # Only awnings need HA-side open/close swap for device class semantics.
+        # flipCommands is handled on each shade; for groups with Invert Commands,
+        # swap open/close here so RF matches after firmware transform.
         self._flip_position = False
+        self._flip_commands = as_bool(data.get("flipCommands"))
         self._process_individual = False
-        flipped = 0
-        notflipped = 0
+        awning = 0
+        not_awning = 0
         if "linkedShades" in data:
             for linked_shade in data["linkedShades"]:
                 if (
                     "shadeType" in linked_shade
                     and int(linked_shade["shadeType"]) == 3
-                    or (
-                        "flipPosition" in linked_shade
-                        and bool(linked_shade["flipPosition"]) is True
-                    )
                 ):
-                    flipped = flipped + 1
+                    awning = awning + 1
                 else:
-                    notflipped = notflipped + 1
+                    not_awning = not_awning + 1
                 self._linked_shade_ids.append(int(linked_shade["shadeId"]))
         uuid = f"{controller.unique_id}_group{self._group_id}"
-        if flipped > 0 and notflipped == 0:
+        if awning > 0 and not_awning == 0:
             self._flip_position = True
-        elif flipped > 0 and notflipped > 0:
+        elif awning > 0 and not_awning > 0:
             self._process_individual = True
         entities = er.async_get(hass)
         shade_ids: list[str] = []
@@ -236,7 +256,7 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
             # for cover_id in self._linked_shade_ids:
             #    if entity.unique_id == f"{self._controller.unique_id}_{cover_id}":
             #        shade_ids.append(entity.entity_id)
-        super().__init__(unique_id=uuid, name=data["name"], entities=shade_ids)
+        super().__init__(unique_id=uuid, name=controller.api.format_entity_name(data), entities=shade_ids)
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to device events."""
@@ -257,6 +277,7 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
         # self._entities = shade_ids
         self._attr_extra_state_attributes = {ATTR_ENTITY_ID: shade_ids}
         await super().async_added_to_hass()
+        self.hass.async_create_task(self._async_sync_room_identity())
         self.async_on_remove(
             self.coordinator.async_add_listener(
                 self._handle_coordinator_update, self.coordinator_context
@@ -303,7 +324,7 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
         if self._process_individual:
-            await super().async_open_cover(kwargs=kwargs)
+            await super().async_open_cover(**kwargs)
         elif self._flip_position:
             await self._controller.api.close_group(self._group_id)
         else:
@@ -312,7 +333,7 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close cover."""
         if self._process_individual:
-            await super().async_close_cover(kwargs=kwargs)
+            await super().async_close_cover(**kwargs)
         elif self._flip_position:
             await self._controller.api.open_group(self._group_id)
         else:
@@ -320,8 +341,7 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Hold cover."""
-        # print(f"Stopping Cover id#{self._shade_id}")
-        await self._controller.api.stop_group(self._group_id)
+        await self._controller.async_stop_group(self._group_id)
 
     async def async_send_command(self, **kwargs: Any) -> None:
         """Send raw command from SVC."""
@@ -342,6 +362,108 @@ class ESPSomfyGroup(CoverGroup, ESPSomfyEntity):
         await self._controller.api.group_command(cmd)
 
 
+class ESPSomfyRoom(ESPSomfyEntity, CoverEntity):
+    """Open/close/stop every shade in a room via the firmware queue."""
+
+    def __init__(self, controller: ESPSomfyController, data) -> None:
+        """Initialize a room cover."""
+        super().__init__(controller=controller, data=data)
+        self._controller = controller
+        self._room_id = int(data["roomId"])
+        self._attr_unique_id = f"{controller.unique_id}_room{self._room_id}"
+        self._attr_name = controller.api.format_entity_name(data)
+        self._attr_device_class = CoverDeviceClass.SHADE
+        self._attr_available = True
+        self._attr_assumed_state = True
+        self._attr_supported_features = (
+            CoverEntityFeature.OPEN
+            | CoverEntityFeature.CLOSE
+            | CoverEntityFeature.STOP
+        )
+
+    def _member_shades(self) -> list[dict]:
+        return room_shades(self._controller.api.shades, self._room_id)
+
+    def _all_awnings(self) -> bool:
+        members = self._member_shades()
+        return bool(members) and all(
+            int(s.get("shadeType", 0)) == 3 for s in members
+        )
+
+    @property
+    def current_cover_position(self) -> int | None:
+        """Average HA-scale position of shades in this room."""
+        poses = []
+        for shade in self._member_shades():
+            ha = ha_position_from_esp(
+                shade.get("position"),
+                flip_position=as_bool(shade.get("flipPosition", False)),
+            )
+            if ha is not None:
+                poses.append(ha)
+        if not poses:
+            return None
+        return int(sum(poses) / len(poses))
+
+    @property
+    def is_closed(self) -> bool | None:
+        """True when every member reports closed (HA scale)."""
+        pos = self.current_cover_position
+        if pos is None:
+            return None
+        return pos <= 5
+
+    @property
+    def is_opening(self) -> bool:
+        """True if any member is moving toward open."""
+        if self._all_awnings():
+            return any(int(s.get("direction") or 0) > 0 for s in self._member_shades())
+        return any(int(s.get("direction") or 0) < 0 for s in self._member_shades())
+
+    @property
+    def is_closing(self) -> bool:
+        """True if any member is moving toward closed."""
+        if self._all_awnings():
+            return any(int(s.get("direction") or 0) < 0 for s in self._member_shades())
+        return any(int(s.get("direction") or 0) > 0 for s in self._member_shades())
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Refresh when a member shade moves."""
+        if self.registry_entry and self.registry_entry.disabled:
+            return
+        data = self._controller.data or {}
+        if data.get("event") == EVT_CONNECTED and "connected" in data:
+            self._attr_available = bool(data["connected"])
+            self.async_write_ha_state()
+            return
+        if data.get("event") == EVT_SHADESTATE:
+            try:
+                rid = int(data.get("roomId") or 0)
+            except (TypeError, ValueError):
+                rid = 0
+            if rid in (0, self._room_id):
+                self.async_write_ha_state()
+
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Open all shades in the room."""
+        cmd = room_rf_command(
+            self._controller.api.shades, self._room_id, "open"
+        )
+        await self._controller.api.room_command(self._room_id, cmd)
+
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Close all shades in the room."""
+        cmd = room_rf_command(
+            self._controller.api.shades, self._room_id, "close"
+        )
+        await self._controller.api.room_command(self._room_id, cmd)
+
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        """Stop all shades in the room."""
+        await self._controller.api.room_command(self._room_id, "stop")
+
+
 class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
     """A shade that is associated with a controller."""
 
@@ -354,20 +476,31 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
         self._tilt_position = 100
         self._tilt_direction = 0
         self._attr_unique_id = f"{controller.unique_id}_{self._shade_id}"
-        self._attr_name = data["name"]
+        self._attr_name = controller.api.format_entity_name(data)
         self._direction = 0
         self._attr_available = True
         self._has_tilt = False
         self._has_lift = True
-        self._flip_position = False
         self._tilt_type = 0
         self._state_attributes: dict[str, Any] = {}
+        room_name = controller.api.get_room_name(controller.api.get_room_id(data))
+        if room_name:
+            self._state_attributes["room"] = room_name
         self._shade_type = 1
         self._last_direction = 0
-        if data.get("flipPosition") is True:
-            self._flip_position = True
+        # ESP flipPosition is applied in the API payload (transformPosition).
+        # Firmware API/UI uses HA scale (100%=open · 0%=closed). Cover passes
+        # that through so Open/Close buttons and sliders match SomfyController.
+        # ESP flipCommands swaps RF Up/Down — HA always sends open→up / close→down.
+        self._apply_device_flags(data)
 
         self._attr_device_class = CoverDeviceClass.SHADE
+        # When always-enabled: keep Open/Close/Stop clickable while moving/open.
+        # Follow-status: HA greys buttons from is_closed / is_opening / is_closing.
+        entry = controller.hass.config_entries.async_get_entry(
+            controller.config_entry_id
+        )
+        self._attr_assumed_state = controls_always_enabled(entry)
 
         self._attr_supported_features = (
             CoverEntityFeature.OPEN
@@ -432,19 +565,34 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
                     self._attr_device_class = CoverDeviceClass.SHADE
 
         self._attr_is_closed: bool = False
+        if self._has_lift:
+            self._attr_current_cover_position = self.current_cover_position
+        if self._has_tilt:
+            self._attr_current_cover_tilt_position = self.current_cover_tilt_position
         # print(f"Set up shade {self._attr_unique_id} - {self._attr_name}")
+
+    def _apply_device_flags(self, data: dict) -> None:
+        """Refresh invert flags from ESP shade payload."""
+        if "flipCommands" in data or not hasattr(self, "_flip_commands"):
+            self._flip_commands = as_bool(data.get("flipCommands", False))
+        if "flipPosition" in data or not hasattr(self, "_flip_position"):
+            self._flip_position = as_bool(data.get("flipPosition", False))
+        self._state_attributes["invert_direction"] = self._flip_commands
+        self._state_attributes["invert_position"] = self._flip_position
+        self._state_attributes["position_scale"] = "100%=open · 0%=closed"
 
     def _handle_state_update(self, data) -> None:
         """Handle the state update."""
         upd = False
 
+        if "flipCommands" in data or "flipPosition" in data:
+            self._apply_device_flags(data)
+            upd = True
         if "remoteAddress" in data and self._state_attributes.get(
             "remote_address", 0
         ) != int(data["remoteAddress"]):
             self._state_attributes["remote_address"] = int(data["remoteAddress"])
             upd = True
-        if "flipPosition" in data:
-            self._flip_position = bool(data["flipPosition"])
         if "position" in data and self._position != data.get("position", -1):
             self._position = int(data["position"])
             upd = True
@@ -462,8 +610,8 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
             self._state_attributes["my_pos"] = int(data.get("myPos", -1))
             upd = True
 
-        if "hasTilt" in data and self._has_tilt != data.get("hasTilt", False):
-            self._has_tilt = bool(data["hasTilt"])
+        if "hasTilt" in data and self._has_tilt != as_bool(data.get("hasTilt", False)):
+            self._has_tilt = as_bool(data["hasTilt"])
         if "tiltType" in self._controller.data:
             match int(self._controller.data["tiltType"]):
                 case 1 | 2:
@@ -502,6 +650,8 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
                 self._attr_current_cover_tilt_position = (
                     self.current_cover_tilt_position
                 )
+            # Garage/gate toggle covers enable/disable Open/Close/Stop from state.
+            self.update_supported_features()
             self.async_write_ha_state()
 
     def _handle_state_command(self, data) -> None:
@@ -603,36 +753,56 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
 
     @property
     def icon(self) -> str:
-        """Icon for the shade."""
-        if hasattr(self, "_attr_icon"):
-            return self._attr_icon
-        if hasattr(self, "entity_description"):
-            return self.entity_description.icon
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            if self.is_closed:
-                return "mdi:storefront-outline"
-            return "mdi:storefront"
-        return None
+        """Icon by Somfy shade type and open/closed/moving state."""
+        openness = visual_openness_from_esp(
+            self._position,
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
+        return shade_mdi_icon(
+            self._shade_type,
+            ha_position=openness,
+            is_opening=bool(self.is_opening),
+            is_closing=bool(self.is_closing),
+            is_closed=bool(self.is_closed),
+        )
+
+    @property
+    def entity_picture(self) -> str | None:
+        """Window illustration (open / partial / closed) like the Somfy UI."""
+        openness = visual_openness_from_esp(
+            self._position,
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
+        return shade_entity_picture(
+            self._shade_type,
+            ha_position=openness,
+            is_opening=bool(self.is_opening),
+            is_closing=bool(self.is_closing),
+            is_closed=bool(self.is_closed),
+            url_prefix=f"/{DOMAIN}/images",
+        )
 
     @property
     def current_cover_position(self) -> int | None:
-        """Return the current position of the shade."""
-        if self._flip_position is True:
-            if self._attr_device_class == CoverDeviceClass.AWNING:
-                return 100 - self._position
-            return self._position
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            return self._position
-        return 100 - self._position
+        """Return HA cover % (100 = open) from ESP API."""
+        return ha_position_from_esp(
+            self._position,
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
 
     @property
     def current_cover_tilt_position(self) -> int | None:
-        """Return current position of cover tilt. 0 is closed, 100 is open."""
+        """Return HA tilt % (100 = open) from ESP API."""
         if not self._has_tilt:
             return None
-        if self._flip_position is True:
-            return self._tilt_position
-        return 100 - self._tilt_position
+        return ha_position_from_esp(
+            self._tilt_position,
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
 
     @property
     def is_opening(self) -> bool:
@@ -651,6 +821,8 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
 
         if self._attr_device_class == CoverDeviceClass.AWNING:
             return self._direction == 1
+        # Internal direction: -1 toward 0 (open), +1 toward 100 (closed).
+        # flipPosition only remaps reported %, not movement direction signs.
         return self._direction == -1 or self._tilt_direction == -1
 
     @property
@@ -674,33 +846,22 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
 
     @property
     def is_closed(self) -> bool:
-        """Return true if cover is closed."""
+        """Return true if cover is closed (API: 0% closed · 100% open)."""
         if self._tilt_type == 3:
             return self._tilt_position in (0, 100)
-        if self._flip_position is True:
-            if self._attr_device_class == CoverDeviceClass.AWNING:
-                return self._position == 100
-            return self._position == 0
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            return self._position == 0
-        return (self._position == 100 or not self._has_lift) and (
-            self._tilt_position == 100 or not self._has_tilt
+        closed_at = 100 if self._flip_position else 0
+        return (self._position == closed_at or not self._has_lift) and (
+            self._tilt_position == closed_at or not self._has_tilt
         )
 
     @property
     def is_open(self) -> bool:
-        """Return true if cover is closed."""
+        """Return true if cover is fully open."""
         if self._tilt_type == 3:
             return self._tilt_position < 100 and self._tilt_position > 0
-
-        if self._flip_position is True:
-            if self._attr_device_class == CoverDeviceClass.AWNING:
-                return self._position == 0
-            return self._position == 100
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            return self._position == 100
-        return (self._position == 0 or not self._has_lift) and (
-            self._tilt_position == 0 or not self._has_tilt
+        open_at = 0 if self._flip_position else 100
+        return (self._position == open_at or not self._has_lift) and (
+            self._tilt_position == open_at or not self._has_tilt
         )
 
     @property
@@ -715,145 +876,140 @@ class ESPSomfyShade(ESPSomfyEntity, CoverEntity):
             return True
         return False
 
+    def _controls_always_enabled(self) -> bool:
+        """Return True when Open/Close/Stop stay enabled regardless of status."""
+        entry = self.hass.config_entries.async_get_entry(
+            self._controller.config_entry_id
+        )
+        return controls_always_enabled(entry)
+
     def update_supported_features(self) -> None:
         """Update the supported features."""
-        if self.is_toggle:
-            if self.is_opening or self.is_closing:
-                self._attr_supported_features |= CoverEntityFeature.STOP
-                self._attr_supported_features &= ~CoverEntityFeature.OPEN
+        if not self.is_toggle:
+            return
+        if self._direction != 0:
+            self._last_direction = self._direction
+        if self._controls_always_enabled():
+            # Keep Open/Close/Stop always available (assumed RF control).
+            self._attr_supported_features |= (
+                CoverEntityFeature.OPEN
+                | CoverEntityFeature.CLOSE
+                | CoverEntityFeature.STOP
+            )
+            return
+        # Follow cover status: enable/disable Open/Close/Stop from state.
+        if self.is_opening or self.is_closing:
+            self._attr_supported_features |= CoverEntityFeature.STOP
+            self._attr_supported_features &= ~CoverEntityFeature.OPEN
+            self._attr_supported_features &= ~CoverEntityFeature.CLOSE
+        else:
+            self._attr_supported_features &= ~CoverEntityFeature.STOP
+            if self.is_closed:
+                self._attr_supported_features |= CoverEntityFeature.CLOSE
+                self._attr_supported_features |= CoverEntityFeature.OPEN
+            elif self.is_open:
+                self._attr_supported_features |= CoverEntityFeature.OPEN
+                self._attr_supported_features |= CoverEntityFeature.CLOSE
+            elif self._last_direction == 1:
+                self._attr_supported_features |= CoverEntityFeature.OPEN
                 self._attr_supported_features &= ~CoverEntityFeature.CLOSE
-                if self._direction != 0:
-                    self._last_direction = self._direction
-            else:
-                self._attr_supported_features &= ~CoverEntityFeature.STOP
-                if self.is_closed:
-                    self._attr_supported_features |= CoverEntityFeature.CLOSE
-                    self._attr_supported_features |= CoverEntityFeature.OPEN
-                elif self.is_open:
-                    self._attr_supported_features |= CoverEntityFeature.OPEN
-                    self._attr_supported_features |= CoverEntityFeature.CLOSE
-                elif self._last_direction == 1:
-                    self._attr_supported_features |= CoverEntityFeature.OPEN
-                    self._attr_supported_features &= ~CoverEntityFeature.CLOSE
-                elif self._last_direction == -1:
-                    self._attr_supported_features &= ~CoverEntityFeature.OPEN
-                    self._attr_supported_features |= CoverEntityFeature.CLOSE
+            elif self._last_direction == -1:
+                self._attr_supported_features &= ~CoverEntityFeature.OPEN
+                self._attr_supported_features |= CoverEntityFeature.CLOSE
 
     async def async_set_cover_tilt_position(self, **kwargs: Any) -> None:
-        """Set the tilt postion."""
-        if self._flip_position is True:
-            await self._controller.api.position_tilt(
-                self._shade_id, int(kwargs[ATTR_TILT_POSITION])
-            )
-        else:
-            await self._controller.api.position_tilt(
-                self._shade_id, 100 - int(kwargs[ATTR_TILT_POSITION])
-            )
+        """Set tilt from HA % (100 = open) into ESP API %."""
+        api_tilt = esp_position_from_ha(
+            int(kwargs[ATTR_TILT_POSITION]),
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
+        if api_tilt is None:
+            return
+        await self._controller.api.position_tilt(self._shade_id, api_tilt)
 
     async def async_open_cover_tilt(self, **kwargs: Any) -> None:
-        """Open the tilt position."""
-        if self._flip_position is True:
-            await self._controller.api.position_tilt(self._shade_id, 100)
-        else:
-            await self._controller.api.position_tilt(self._shade_id, 0)
+        """Open the tilt (API 100% unless Invert % reading)."""
+        target = 0 if self._flip_position else 100
+        await self._controller.api.position_tilt(self._shade_id, target)
 
     async def async_close_cover_tilt(self, **kwargs: Any) -> None:
-        """Close the tilt position."""
-        if self._flip_position is True:
-            await self._controller.api.position_tilt(self._shade_id, 0)
-        else:
-            await self._controller.api.position_tilt(self._shade_id, 100)
+        """Close the tilt (API 0% unless Invert % reading)."""
+        target = 100 if self._flip_position else 0
+        await self._controller.api.position_tilt(self._shade_id, target)
 
     async def async_stop_cover_tilt(self, **kwargs: Any) -> None:
         """Stop tilting a tilt only shade."""
-        await self._controller.api.stop_shade(self._shade_id)
+        await self._controller.async_stop_shade(self._shade_id)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
-        """Set the cover position."""
-        if self._flip_position is True:
-            if self._attr_device_class == CoverDeviceClass.AWNING:
-                await self._controller.api.position_shade(
-                    self._shade_id, 100 - int(kwargs[ATTR_POSITION])
-                )
-            else:
-                await self._controller.api.position_shade(
-                    self._shade_id, int(kwargs[ATTR_POSITION])
-                )
+        """Set cover from HA % (100 = open) into ESP API %."""
+        api_pos = esp_position_from_ha(
+            int(kwargs[ATTR_POSITION]),
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
+        if api_pos is None:
             return
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            await self._controller.api.position_shade(
-                self._shade_id, int(kwargs[ATTR_POSITION])
-            )
-        else:
-            await self._controller.api.position_shade(
-                self._shade_id, 100 - int(kwargs[ATTR_POSITION])
-            )
+        await self._controller.api.position_shade(self._shade_id, api_pos)
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
-        # print(f"Opening Cover id#{self._shade_id}")
-        # This is ridiculous in that we need to invert these
-        # if the type is an awning.
-        # print(f"Opening Cover id#{self._shade_id} {self._attr_device_class}")
         if self.is_toggle:
             if self._direction in (0, 1):
                 await self._controller.api.shade_command(
                     {"shadeId": self._shade_id, "command": "toggle"}
                 )
-        elif self._attr_device_class == CoverDeviceClass.AWNING:
+            return
+        # Awnings: HA open/close opposite of ESP up/down.
+        # flipCommands is applied on the ESP — do not also swap here.
+        if self._attr_device_class == CoverDeviceClass.AWNING:
             await self._controller.api.close_shade(self._shade_id)
         else:
             await self._controller.api.open_shade(self._shade_id)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close cover."""
-        # print(f"Closing Cover id#{self._shade_id} {self._attr_device_class}")
         if self.is_toggle:
             await self._controller.api.shade_command(
                 {"shadeId": self._shade_id, "command": "toggle"}
             )
-        elif self._attr_device_class == CoverDeviceClass.AWNING:
+            return
+        if self._attr_device_class == CoverDeviceClass.AWNING:
             await self._controller.api.open_shade(self._shade_id)
         else:
             await self._controller.api.close_shade(self._shade_id)
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
-        """Hold cover."""
-        # print(f"Stopping Cover id#{self._shade_id}")
+        """Hold cover — RF stop and freeze reported position immediately."""
         if self.is_toggle:
             await self._controller.api.shade_command(
                 {"shadeId": self._shade_id, "command": "toggle"}
             )
-        else:
-            await self._controller.api.stop_shade(self._shade_id)
+            return
+        await self._controller.async_stop_shade(self._shade_id)
 
     async def async_set_current_position(self, **kwargs: Any) -> None:
         """Set the current position for the device without moving it."""
-        if self._flip_position is True:
-            if self._attr_device_class == CoverDeviceClass.AWNING:
-                await self._controller.api.set_current_position(
-                    self._shade_id, 100 - int(kwargs[ATTR_POSITION])
-                )
-            else:
-                await self._controller.api.set_current_position(
-                    self._shade_id, int(kwargs[ATTR_POSITION])
-                )
+        api_pos = esp_position_from_ha(
+            int(kwargs[ATTR_POSITION]),
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
+        )
+        if api_pos is None:
             return
-        if self._attr_device_class == CoverDeviceClass.AWNING:
-            await self._controller.api.set_current_position(
-                self._shade_id, int(kwargs[ATTR_POSITION])
-            )
-        else:
-            await self._controller.api.set_current_position(
-                self._shade_id, 100 - int(kwargs[ATTR_POSITION])
-            )
+        await self._controller.async_set_current_position(self._shade_id, api_pos)
 
     async def async_set_current_tilt_position(self, **kwargs: Any) -> None:
         """Set the current tilt position for the device without moving it."""
-        await self._controller.api.set_current_tilt_position(
-            self._shade_id, int(kwargs[ATTR_TILT_POSITION])
+        api_tilt = esp_position_from_ha(
+            int(kwargs[ATTR_TILT_POSITION]),
+            flip_position=self._flip_position,
+            device_class=self._attr_device_class,
         )
-
+        if api_tilt is None:
+            return
+        await self._controller.async_set_current_tilt_position(self._shade_id, api_tilt)
     async def async_set_sunny(self, **kwargs: Any) -> None:
         """Set the sensor value for the device by sending the appropriate frames."""
         await self._controller.api.set_sunny(self._shade_id, bool(kwargs[ATTR_SUNNY]))

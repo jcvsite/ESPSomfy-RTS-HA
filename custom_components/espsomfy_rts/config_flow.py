@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import voluptuous as vol
@@ -18,15 +17,20 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.selector import (
-    TextSelector,
-    TextSelectorConfig,
-    TextSelectorType,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
 )
 from homeassistant.util.network import is_host_valid
 
-from .const import DOMAIN
+from .const import (
+    CONF_CONTROL_MODE,
+    CONTROL_MODE_ALWAYS,
+    CONTROL_MODE_FOLLOW_STATUS,
+    DEFAULT_CONTROL_MODE,
+    DOMAIN,
+)
 from .controller import (
     DiscoveryError,
     ESPSomfyAPI,
@@ -34,29 +38,6 @@ from .controller import (
     InvalidHost,
     LoginError,
 )
-
-DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HOST, "Server Address"): TextSelector(
-            TextSelectorConfig(type=TextSelectorType.URL)
-        )
-    }
-)
-
-_LOGGER = logging.getLogger(__name__)
-
-
-async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect."""
-
-    session = aiohttp_client.async_get_clientsession(hass)
-    async with session.get(f'http://{data["host"]}/discovery') as resp:
-        if resp.status == 200:
-            pass
-        else:
-            raise DiscoveryError(f"{await resp.text()}")
-    return {"title": "ESPSomfy RTS", "server_id": "A1"}
-
 
 # The ConfigFlow is only accessed when first setting up the integration.  This simply
 # collects the initial data from the user to determine whether the integration can
@@ -113,6 +94,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     title=api.deviceName,
                     description=f"ESPSomfy RTS {api.server_id}",
                     data=user_input,
+                    options={CONF_CONTROL_MODE: DEFAULT_CONTROL_MODE},
                 )
             except InvalidHost:
                 errors[CONF_HOST] = "wrong_host"
@@ -165,6 +147,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data={
                     CONF_HOST: self.zero_conf.host,
                 },
+                options={CONF_CONTROL_MODE: DEFAULT_CONTROL_MODE},
             )
 
         return self.async_show_form(
@@ -216,14 +199,28 @@ class ESPSomfyOptionsFlowHandler(config_entries.OptionsFlow):
                         "pin": user_input.get(CONF_PIN, ""),
                     }
                 )
-                # Update config entry with data from user input
+                control_mode = user_input.get(
+                    CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE
+                )
+                if control_mode not in (
+                    CONTROL_MODE_ALWAYS,
+                    CONTROL_MODE_FOLLOW_STATUS,
+                ):
+                    control_mode = DEFAULT_CONTROL_MODE
+                # Credentials stay in data; behavioral setting in options.
+                options = {CONF_CONTROL_MODE: control_mode}
                 self.hass.config_entries.async_update_entry(
-                    self._config_entry, title=api.deviceName, data=user_input
-                )
-                return self.async_create_entry(
+                    self._config_entry,
                     title=api.deviceName,
-                    data=user_input,
+                    data={
+                        CONF_HOST: user_input[CONF_HOST],
+                        CONF_USERNAME: user_input.get(CONF_USERNAME, ""),
+                        CONF_PASSWORD: user_input.get(CONF_PASSWORD, ""),
+                        CONF_PIN: user_input.get(CONF_PIN, ""),
+                    },
+                    options=options,
                 )
+                return self.async_create_entry(title="", data=options)
             except InvalidHost:
                 errors[CONF_HOST] = "wrong_host"
             except ConnectionError:
@@ -236,7 +233,11 @@ class ESPSomfyOptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=_get_data_schema(
-                self.hass, data=self._config_entry.data, host=self._host
+                self.hass,
+                data=self._config_entry.data,
+                host=self._host,
+                options=self._config_entry.options,
+                include_control_mode=True,
             ),
             errors=errors,
         )
@@ -246,20 +247,20 @@ def _get_data_schema(
     hass: HomeAssistant,
     data: dict[str, Any] | None = None,
     host: str = "",
+    options: dict[str, Any] | None = None,
+    include_control_mode: bool = False,
 ) -> vol.Schema:
     """Get a schema with default values."""
     # If tracking home or no config entry is passed in, default value come from Home location
     if data is None or data.get(CONF_HOST, host) == "":
-        return vol.Schema(
-            {
-                vol.Required(CONF_HOST, default=host): str,
-                vol.Optional(CONF_USERNAME, description={"suggested_value": ""}): str,
-                vol.Optional(CONF_PASSWORD, description={"suggested_value": ""}): str,
-                vol.Optional(CONF_PIN, description={"suggested_value": ""}): str,
-            }
-        )
-    return vol.Schema(
-        {
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_HOST, default=host): str,
+            vol.Optional(CONF_USERNAME, description={"suggested_value": ""}): str,
+            vol.Optional(CONF_PASSWORD, description={"suggested_value": ""}): str,
+            vol.Optional(CONF_PIN, description={"suggested_value": ""}): str,
+        }
+    else:
+        schema = {
             vol.Required(CONF_HOST, default=data.get(CONF_HOST)): str,
             vol.Optional(
                 CONF_USERNAME,
@@ -274,4 +275,21 @@ def _get_data_schema(
                 description={"suggested_value": data.get(CONF_PIN, None)},
             ): str,
         }
-    )
+
+    if include_control_mode:
+        current_mode = DEFAULT_CONTROL_MODE
+        if options:
+            current_mode = options.get(CONF_CONTROL_MODE, current_mode)
+        elif data:
+            current_mode = data.get(CONF_CONTROL_MODE, current_mode)
+        schema[
+            vol.Required(CONF_CONTROL_MODE, default=current_mode)
+        ] = SelectSelector(
+            SelectSelectorConfig(
+                options=[CONTROL_MODE_ALWAYS, CONTROL_MODE_FOLLOW_STATUS],
+                mode=SelectSelectorMode.DROPDOWN,
+                translation_key="control_mode",
+            )
+        )
+
+    return vol.Schema(schema)

@@ -46,6 +46,33 @@
       }
     }
   },
+  "entity": {
+    "switch": {
+      "invert_direction": {
+        "name": "Inverser la direction"
+      },
+      "invert_position": {
+        "name": "Inverser la lecture %"
+      },
+      "invert_on_off": {
+        "name": "Inverser ON/OFF"
+      },
+      "single_button_remote": {
+        "name": "Télécommande à un bouton"
+      }
+    },
+    "number": {
+      "open_travel_time": {
+        "name": "Durée d'ouverture"
+      },
+      "close_travel_time": {
+        "name": "Durée de fermeture"
+      },
+      "calibrate_position": {
+        "name": "Calibrer la position (100%=ouvert)"
+      }
+    }
+  },
   "options": {
     "error": {
       "cannot_connect": "Échec de la connexion",
@@ -62,10 +89,39 @@
           "host": "Adresse hôte pour le dispositif ESPSomfy RTS",
           "username": "Nom d'utilisateur",
           "password": "Mot de passe",
-          "pin": "Code PIN"
+          "pin": "Code PIN",
+          "control_mode": "Commandes du cover"
+        },
+        "data_description": {
+          "control_mode": "Toujours activer garde Ouvrir/Fermer/Stop cliquables. Suivre l'état grise les boutons selon ouvert, fermé ou en mouvement."
         },
         "title": "Configurer ESPSomfy RTS",
         "description": "Paramétrage des options de sécurité configurées pour votre dispositif"
+      }
+    }
+  },
+  "selector": {
+    "control_mode": {
+      "options": {
+        "always": "Toujours activer les commandes",
+        "follow_status": "Suivre l'état du cover"
+      }
+    }
+  },
+  "services": {
+    "apply_scene": {
+      "name": "Appliquer une scène",
+      "description": "Exécuter une scène enregistrée sur le contrôleur ESPSomfy",
+      "fields": {
+        "scene_id": { "name": "ID de scène", "description": "Numéro de scène (1–8)" }
+      }
+    },
+    "room_command": {
+      "name": "Commande de pièce",
+      "description": "Ouvrir, fermer, My ou arrêter tous les stores d'une pièce",
+      "fields": {
+        "room_id": { "name": "ID de pièce", "description": "Numéro de pièce (0 = toutes)" },
+        "command": { "name": "Commande", "description": "up, my, down ou stop" }
       }
     }
   }

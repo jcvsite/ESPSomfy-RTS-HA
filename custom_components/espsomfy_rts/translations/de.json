@@ -46,6 +46,33 @@
       }
     }
   },
+  "entity": {
+    "switch": {
+      "invert_direction": {
+        "name": "Richtung umkehren"
+      },
+      "invert_position": {
+        "name": "%-Anzeige umkehren"
+      },
+      "invert_on_off": {
+        "name": "ON/OFF umkehren"
+      },
+      "single_button_remote": {
+        "name": "Ein-Tasten-Fernbedienung"
+      }
+    },
+    "number": {
+      "open_travel_time": {
+        "name": "Öffnungsdauer"
+      },
+      "close_travel_time": {
+        "name": "Schließdauer"
+      },
+      "calibrate_position": {
+        "name": "Position kalibrieren (100%=offen)"
+      }
+    }
+  },
   "options": {
     "error": {
       "cannot_connect": "Verbindungsfehler",
@@ -62,10 +89,39 @@
           "host": "ESPSomfy RTS Hostname oder IP",
           "username": "Name",
           "password": "Passwort",
-          "pin": "PIN"
+          "pin": "PIN",
+          "control_mode": "Cover-Steuerung"
+        },
+        "data_description": {
+          "control_mode": "Immer aktiviert lässt Öffnen/Schließen/Stopp klickbar. Status folgen deaktiviert Tasten je nach offen/geschlossen/bewegend."
         },
         "title": "ESPSomfy RTS Konfiguration",
         "description": "Geben Sie Ihre Daten ein."
+      }
+    }
+  },
+  "selector": {
+    "control_mode": {
+      "options": {
+        "always": "Steuerung immer aktivieren",
+        "follow_status": "Cover-Status folgen"
+      }
+    }
+  },
+  "services": {
+    "apply_scene": {
+      "name": "Szene ausführen",
+      "description": "Eine auf dem ESPSomfy-Controller gespeicherte Szene ausführen",
+      "fields": {
+        "scene_id": { "name": "Szenen-ID", "description": "Szenennummer (1–8)" }
+      }
+    },
+    "room_command": {
+      "name": "Raumbefehl",
+      "description": "Alle Behänge eines Raums öffnen, schließen, My oder stoppen",
+      "fields": {
+        "room_id": { "name": "Raum-ID", "description": "Raumnummer (0 = alle Räume)" },
+        "command": { "name": "Befehl", "description": "up, my, down oder stop" }
       }
     }
   }

@@ -46,6 +46,33 @@
       }
     }
   },
+  "entity": {
+    "switch": {
+      "invert_direction": {
+        "name": "Invert direction"
+      },
+      "invert_position": {
+        "name": "Invert % reading"
+      },
+      "invert_on_off": {
+        "name": "Invert ON/OFF"
+      },
+      "single_button_remote": {
+        "name": "Single-button remote"
+      }
+    },
+    "number": {
+      "open_travel_time": {
+        "name": "Full open time"
+      },
+      "close_travel_time": {
+        "name": "Full close time"
+      },
+      "calibrate_position": {
+        "name": "Calibrate position (100%=open)"
+      }
+    }
+  },
   "options": {
     "error": {
       "cannot_connect": "Failed to connect",
@@ -62,10 +89,48 @@
           "host": "Host address for the ESPSomfy RTS device",
           "username": "Username",
           "password": "Password",
-          "pin": "Pin Number"
+          "pin": "Pin Number",
+          "control_mode": "Cover controls"
+        },
+        "data_description": {
+          "control_mode": "Always enable keeps Open/Close/Stop clickable. Follow cover status greys buttons based on open, closed, or moving."
         },
         "title": "Configure ESPSomfy RTS",
         "description": "Provide the configured security options for your device"
+      }
+    }
+  },
+  "selector": {
+    "control_mode": {
+      "options": {
+        "always": "Always enable controls",
+        "follow_status": "Follow cover status"
+      }
+    }
+  },
+  "services": {
+    "apply_scene": {
+      "name": "Apply scene",
+      "description": "Run a named scene stored on the ESPSomfy controller",
+      "fields": {
+        "scene_id": {
+          "name": "Scene ID",
+          "description": "Scene number (1–8)"
+        }
+      }
+    },
+    "room_command": {
+      "name": "Room command",
+      "description": "Open, close, My, or stop every shade in a room",
+      "fields": {
+        "room_id": {
+          "name": "Room ID",
+          "description": "Room number (0 = all rooms)"
+        },
+        "command": {
+          "name": "Command",
+          "description": "up, my, down, or stop"
+        }
       }
     }
   }

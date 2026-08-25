@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from homeassistant.components.update import (
     UpdateDeviceClass,
@@ -105,6 +105,7 @@ class ESPSomfyRTSUpdateEntity(ESPSomfyEntity, UpdateEntity):
     @property
     def can_install(self) -> bool:
         """Indicates whether the current version supports firmware installation."""
+        return bool(self._controller.can_update)
 
     @property
     def installed_version(self) -> str | None:
@@ -134,7 +135,7 @@ class ESPSomfyRTSUpdateEntity(ESPSomfyEntity, UpdateEntity):
         """URL to the full release notes of the latest version available."""
         if (version := self.latest_version) is None:
             return None
-        return f"https://github.com/rstrouse/ESPSomfy-RTS/releases/tag/{version}"
+        return f"https://github.com/jcvsite/ESPSomfy-RTS/releases/tag/{version}"
 
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
@@ -143,8 +144,8 @@ class ESPSomfyRTSUpdateEntity(ESPSomfyEntity, UpdateEntity):
         success = True
         if backup:
             success = await self._controller.create_backup()
-        if success:
-            # We cast here, we know that the latest_version is supposed to be a string.
-            version = cast(str, self.latest_version)
-            if version is not None:
-                await self.controller.update_firmware(version)
+        if not success:
+            return
+        target = version or self.latest_version
+        if target:
+            await self.controller.update_firmware(target)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime
 import json
 import logging
@@ -13,11 +14,10 @@ from typing import Any
 
 import aiofiles
 import aiohttp
-from packaging.version import parse as version_parse
 import websocket
 
 from homeassistant.components.cover import CoverDeviceClass, CoverEntityFeature
-from homeassistant.const import CONF_HOST, CONF_PIN, CONF_USERNAME, Platform
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PIN, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
@@ -31,17 +31,25 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     API_DISCOVERY,
+    API_FIXEDCODECOMMAND,
+    API_FIXEDCODES,
+    API_SAVEFIXEDCODE,
     API_GROUPCOMMAND,
     API_GROUPS,
     API_LOGIN,
+    API_ROOMCOMMAND,
+    API_SCENECOMMAND,
     API_SETPOSITIONS,
     API_SETSENSOR,
+    API_SHADE,
     API_SHADECOMMAND,
     API_SHADES,
     API_TILTCOMMAND,
     DOMAIN,
     EVT_CONNECTED,
     EVT_ETHERNET,
+    EVT_FIXEDCODEREMOVED,
+    EVT_FIXEDCODESTATE,
     EVT_FWSTATUS,
     EVT_GROUPSTATE,
     EVT_MEMSTATUS,
@@ -51,8 +59,11 @@ from .const import (
     EVT_SHADESTATE,
     EVT_UPDPROGRESS,
     EVT_WIFISTRENGTH,
+    MANUFACTURER,
     PLATFORMS,
 )
+
+from .helpers import parse_firmware_version
 
 _LOGGER = logging.getLogger(__name__)
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
@@ -118,8 +129,9 @@ class SocketListener(threading.Thread):
         """Reconnect to the web socket."""
         if self._connect_timer is not None:
             self._connect_timer.cancel()
+            self._connect_timer = None
         self.reconnects = self.reconnects + 1
-        self.main_loop = asyncio.get_event_loop()
+        self.main_loop = self.hass.loop
         try:
             self.ws_app = websocket.WebSocketApp(
                 self.url,
@@ -130,23 +142,18 @@ class SocketListener(threading.Thread):
                 keep_running=True,
             )
             self.main_loop.run_in_executor(None, self.ws_begin)
-            self._connect_timer = None
-            self.connected = True
+            # connected is set only in ws_onopen / "connected" ping reply
+        except (
+            websocket.WebSocketAddressException,
+            websocket.WebSocketTimeoutException,
+            websocket.WebSocketConnectionClosedException,
+        ):
+            delay = min(10 * self.reconnects / 2, 20)
 
-        except websocket.WebSocketAddressException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
-            self._connect_timer.start()
-        except websocket.WebSocketTimeoutException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
-            self._connect_timer.start()
-        except websocket.WebSocketConnectionClosedException:
-            self._connect_timer = Timer(
-                min(10 * self.reconnects / 2, 20), self.reconnect
-            )
+            def _retry() -> None:
+                self.hass.loop.call_soon_threadsafe(self.reconnect)
+
+            self._connect_timer = Timer(delay, _retry)
             self._connect_timer.start()
 
     def set_filter(self, arr: Any) -> None:
@@ -179,6 +186,7 @@ class SocketListener(threading.Thread):
     def ws_onopen(self, wsapp):
         """Open the socket."""
         self.connected = True
+        self.reconnects = 0
         self.hass.loop.call_soon_threadsafe(self.onopen)
 
     def ws_onmessage(self, wsapp, message: str):
@@ -198,15 +206,16 @@ class SocketListener(threading.Thread):
             elif message.lower() == "connected":
                 self.reconnects = 0
                 self.connected = True
-        except Exception as e:
-            _LOGGER.debug(e.message)
-            raise
-
+        except Exception as e:  # noqa: BLE001
+            # Bad frame must not kill the listener / trigger reconnect storms.
+            _LOGGER.warning("ESPSomfy socket payload error: %s", e)
 
 class ESPSomfyController(DataUpdateCoordinator):
     """Data coordinator/controller for receiving from ESPSomfy_RTS."""
 
-    def __init__(self, config_entry_id, hass: HomeAssistant, api: ESPSomfyAPI) -> None:
+    def __init__(
+        self, config_entry_id, hass: HomeAssistant, api: ESPSomfyAPI
+    ) -> None:
         """Initialize data coordinator."""
         super().__init__(
             hass,
@@ -290,6 +299,8 @@ class ESPSomfyController(DataUpdateCoordinator):
                 EVT_SHADESTATE,
                 EVT_SHADECOMMAND,
                 EVT_GROUPSTATE,
+                EVT_FIXEDCODESTATE,
+                EVT_FIXEDCODEREMOVED,
                 EVT_FWSTATUS,
                 EVT_UPDPROGRESS,
                 EVT_WIFISTRENGTH,
@@ -298,6 +309,76 @@ class ESPSomfyController(DataUpdateCoordinator):
             ]
         )
         await self.ws_listener.connect()
+
+    def _push_shade_state(self, shade_id: int) -> None:
+        """Refresh HA entities from cached shade state without waiting for WS."""
+        shade = self.api.get_shade(shade_id)
+        if shade is None:
+            return
+        payload = dict(shade)
+        payload["event"] = EVT_SHADESTATE
+        self.async_set_updated_data(payload)
+
+    async def async_update_shade_settings(
+        self, shade_id: int, settings: dict[str, Any]
+    ) -> bool:
+        """Update shade settings on the ESP and refresh all HA entities."""
+        ok = await self.api.update_shade_settings(shade_id, settings)
+        if ok:
+            self._push_shade_state(shade_id)
+        return ok
+
+    async def async_stop_shade(self, shade_id: int) -> bool:
+        """Stop shade RF + freeze HA position/direction from the ACK immediately."""
+        ok = await self.api.stop_shade(shade_id)
+        if ok:
+            shade = self.api.get_shade(shade_id)
+            if shade is not None:
+                shade["direction"] = 0
+                shade["tiltDirection"] = 0
+                if "position" in shade:
+                    shade["target"] = shade["position"]
+                if "tiltPosition" in shade:
+                    shade["tiltTarget"] = shade["tiltPosition"]
+            self._push_shade_state(shade_id)
+        return ok
+
+    async def async_stop_group(self, group_id: int) -> bool:
+        """Stop group RF and refresh entities."""
+        ok = await self.api.stop_group(group_id)
+        if ok:
+            self.async_set_updated_data(
+                {"event": EVT_GROUPSTATE, "groupId": group_id, "direction": 0}
+            )
+        return ok
+
+    async def async_set_current_position(self, shade_id: int, position: int) -> bool:
+        """Calibrate reported position on ESP and refresh HA entities immediately."""
+        ok = await self.api.set_current_position(shade_id, position)
+        if ok:
+            self._push_shade_state(shade_id)
+        return ok
+
+    async def async_set_current_tilt_position(
+        self, shade_id: int, tilt_position: int
+    ) -> bool:
+        """Calibrate reported tilt on ESP and refresh HA entities immediately."""
+        ok = await self.api.set_current_tilt_position(shade_id, tilt_position)
+        if ok:
+            self._push_shade_state(shade_id)
+        return ok
+
+    async def async_update_fixed_code_settings(
+        self, switch_id: int, settings: dict[str, Any]
+    ) -> bool:
+        """Update FixedCode settings on the ESP and refresh HA entities."""
+        ok = await self.api.update_fixed_code_settings(switch_id, settings)
+        fc = self.api.get_fixed_code(switch_id)
+        if fc is not None:
+            payload = dict(fc)
+            payload["event"] = EVT_FIXEDCODESTATE
+            self.async_set_updated_data(payload)
+        return ok
 
     async def create_backup(self) -> bool:
         """Create a backup of the configuration and stores it in HA."""
@@ -312,13 +393,25 @@ class ESPSomfyController(DataUpdateCoordinator):
         if self.api.get_host() != host:
             # Tear down the socket
             self.api.set_host(host)
-            self.ws_connect()
+            await self.ws_connect()
 
     def ensure_group_configured(self, data):
         """Ensure the group exists on Home Assistant."""
         uuid = f"{self.unique_id}_group{data['groupId']}"
         devices = dr.async_get(self.hass)
-        device = devices.async_get_device({(DOMAIN, self.unique_id)})
+        room_name = self.api.get_room_name(self.api.get_room_id(data))
+        display_name = self.api.format_entity_name(data)
+        device_kwargs: dict[str, Any] = {
+            "config_entry_id": self.config_entry_id,
+            "identifiers": {(DOMAIN, f"group_{self.unique_id}_{data['groupId']}")},
+            "via_device": (DOMAIN, self.unique_id),
+            "manufacturer": MANUFACTURER,
+            "name": display_name,
+            "model": "ESPSomfy RTS Group",
+        }
+        if room_name:
+            device_kwargs["suggested_area"] = room_name
+        device = devices.async_get_or_create(**device_kwargs)
         entities = er.async_get(self.hass)
         for entity in er.async_entries_for_config_entry(entities, self.config_entry_id):
             if entity.unique_id == uuid:
@@ -327,18 +420,17 @@ class ESPSomfyController(DataUpdateCoordinator):
             CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP
         )
 
-        dev_class = CoverDeviceClass.SHADE
         # Reload all the shades
         # self.api.load_shades()
         # I have no idea whether this reloads the devices or not.
         entities.async_get_or_create(
             domain=DOMAIN,
             platform=Platform.COVER,
-            original_device_class=dev_class,
+            original_device_class=CoverDeviceClass.SHADE,
             unique_id=uuid,
             device_id=device.id,
-            original_name=data["name"],
-            suggested_object_id=f"{str(data['name']).lower().replace(' ', '_')}",
+            original_name=display_name,
+            suggested_object_id=self.api.suggest_object_id(data),
             supported_features=dev_features,
         )
 
@@ -347,7 +439,19 @@ class ESPSomfyController(DataUpdateCoordinator):
         uuid = f"{self.unique_id}_{data['shadeId']}"
 
         devices = dr.async_get(self.hass)
-        device = devices.async_get_device({(DOMAIN, self.unique_id)})
+        room_name = self.api.get_room_name(self.api.get_room_id(data))
+        display_name = self.api.format_entity_name(data)
+        device_kwargs: dict[str, Any] = {
+            "config_entry_id": self.config_entry_id,
+            "identifiers": {(DOMAIN, f"shade_{self.unique_id}_{data['shadeId']}")},
+            "via_device": (DOMAIN, self.unique_id),
+            "manufacturer": MANUFACTURER,
+            "name": display_name,
+            "model": "ESPSomfy RTS Device",
+        }
+        if room_name:
+            device_kwargs["suggested_area"] = room_name
+        device = devices.async_get_or_create(**device_kwargs)
 
         entities = er.async_get(self.hass)
 
@@ -384,6 +488,12 @@ class ESPSomfyController(DataUpdateCoordinator):
                     dev_class = CoverDeviceClass.CURTAIN
                 case 3:
                     dev_class = CoverDeviceClass.AWNING
+                case 4:
+                    dev_class = CoverDeviceClass.SHUTTER
+                case 5 | 6:
+                    dev_class = CoverDeviceClass.GARAGE
+                case 11 | 12 | 13 | 14 | 15 | 16:
+                    dev_class = CoverDeviceClass.GATE
                 case _:
                     dev_class = CoverDeviceClass.SHADE
 
@@ -396,8 +506,8 @@ class ESPSomfyController(DataUpdateCoordinator):
             original_device_class=dev_class,
             unique_id=uuid,
             device_id=device.id,
-            original_name=data["name"],
-            suggested_object_id=f"{str(data['name']).lower().replace(' ', '_')}",
+            original_name=display_name,
+            suggested_object_id=self.api.suggest_object_id(data),
             supported_features=dev_features,
         )
 
@@ -413,6 +523,8 @@ class ESPSomfyController(DataUpdateCoordinator):
         # this will allow us to simply update the latest firmware
         if "event" in data and data["event"] == EVT_FWSTATUS:
             self.api.set_firmware(data)
+        if data.get("event") == EVT_SHADESTATE:
+            self.api.merge_shade_state(data)
 
         self.async_set_updated_data(data=data)
 
@@ -463,6 +575,8 @@ class ESPSomfyAPI:
         self._can_update = False
         self._config_entry_id = config_entry_id
         self._configured = False
+        # ESP RF TX is blocking; serialize HTTP so closing N covers all get sent.
+        self._radio_lock = asyncio.Lock()
 
     @property
     def shades(self) -> Any:
@@ -471,12 +585,105 @@ class ESPSomfyAPI:
             return self._config["shades"]
         return []
 
+    def get_shade(self, shade_id: int) -> dict[str, Any] | None:
+        """Return cached shade dict by id."""
+        for shade in self.shades:
+            try:
+                if int(shade.get("shadeId", -1)) == int(shade_id):
+                    return shade
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def merge_shade_state(self, data: dict[str, Any]) -> None:
+        """Merge a shadeState / shade payload into the cached shade list."""
+        try:
+            shade_id = int(data["shadeId"])
+        except (KeyError, TypeError, ValueError):
+            return
+        skip = {"event", "ok", "cmdStatus", "stoppedMove", "status", "desc", "code"}
+        shade = self.get_shade(shade_id)
+        if shade is None:
+            self._config.setdefault("shades", []).append(
+                {k: v for k, v in data.items() if k not in skip}
+            )
+            return
+        for key, value in data.items():
+            if key in skip:
+                continue
+            shade[key] = value
+
+    def shade_is_idle(self, shade_id: int) -> bool:
+        """True when shade is not currently moving (lift or tilt)."""
+        shade = self.get_shade(shade_id)
+        if shade is None:
+            return True
+        try:
+            return int(shade.get("direction", 0)) == 0 and int(
+                shade.get("tiltDirection", 0)
+            ) == 0
+        except (TypeError, ValueError):
+            return True
+
     @property
     def groups(self) -> Any:
         """Return the state groups."""
         if "groups" in self._config:
             return self._config["groups"]
         return []
+
+    @property
+    def fixed_codes(self) -> Any:
+        """Return fixed-code RF switches."""
+        if "fixedCodes" in self._config:
+            return self._config["fixedCodes"]
+        return []
+
+    @property
+    def rooms(self) -> Any:
+        """Return rooms from discovery."""
+        if "rooms" in self._config:
+            return self._config["rooms"]
+        return []
+
+    def get_room_id(self, data: dict | None) -> int:
+        """Extract roomId from shade/group payload."""
+        if not data:
+            return 0
+        try:
+            return int(data.get("roomId") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def get_room_name(self, room_id: int | None) -> str | None:
+        """Resolve a room display name from discovery rooms."""
+        if not room_id:
+            return None
+        for room in self.rooms:
+            try:
+                if int(room.get("roomId", 0)) == int(room_id):
+                    name = room.get("name")
+                    if name:
+                        return str(name)
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return None
+
+    def format_entity_name(self, data: dict | None) -> str:
+        """Return the device name only (room is suggested_area, not part of the name)."""
+        if not data:
+            return "Unknown"
+        base = str(data.get("name") or "").strip()
+        return base or "Unknown"
+
+    def suggest_object_id(self, data: dict | None, suffix: str | None = None) -> str:
+        """Suggest an entity object id from the device name."""
+        from homeassistant.util import slugify
+
+        object_id = slugify(self.format_entity_name(data))
+        if suffix:
+            object_id = f"{object_id}_{slugify(suffix)}"
+        return object_id
 
     @property
     def server_id(self) -> str | None:
@@ -505,12 +712,12 @@ class ESPSomfyAPI:
     @property
     def model(self) -> str:
         """Getter for the model number."""
-        return self._config["model"]
+        return self._config.get("model") or "ESPSomfy RTS"
 
     @property
     def apiKey(self) -> str:
         """Getter for the api key."""
-        return self._config["apiKey"]
+        return self._config.get("apiKey") or ""
 
     @property
     def deviceName(self) -> str:
@@ -539,7 +746,8 @@ class ESPSomfyAPI:
         """Check to see if the ESPSomfy RTS hardware has internet."""
         if "inetAvailable" in self._config:
             return self._config["inetAvailable"]
-        return self._can_update
+        # Unknown until fwStatus arrives — do not treat as online.
+        return False
 
     @property
     def is_configured(self) -> bool:
@@ -606,7 +814,7 @@ class ESPSomfyAPI:
             ):
                 dev_registry.async_update_device(dev.id, sw_version=new_ver)
         self._config["version"] = new_ver
-        v = version_parse(new_ver)
+        v = parse_firmware_version(new_ver)
         if (
             (v.major > 2)
             or (v.major == 2 and v.minor > 2)
@@ -647,13 +855,13 @@ class ESPSomfyAPI:
 
                 os.makedirs(self.backup_dir, exist_ok=True)
 
-                data = await resp.text(encoding=None)
+                data = await resp.read()
                 local_dt = dt_util.as_local(datetime.now(dt_util.UTC))
                 fpath = self.hass.config.path(
                     f"{self.backup_dir}/{local_dt.strftime('%Y-%m-%dT%H_%M_%S')}.backup"
                 )
             async with aiofiles.open(fpath, mode="wb+") as f:
-                await f.write(data.encode())
+                await f.write(data)
                 return True
         except Exception as e:  # noqa: BLE001
             _LOGGER.error("An error occurred while creating backup: %s", e)
@@ -697,6 +905,12 @@ class ESPSomfyAPI:
             self._config["groups"] = data["groups"]
         elif "groups" not in self._config:
             self._config["groups"] = []
+        if "fixedCodes" in data:
+            self._config["fixedCodes"] = data["fixedCodes"]
+        elif "fixedCodes" not in self._config:
+            self._config["fixedCodes"] = []
+        if "maxFixedCodes" in data:
+            self._config["maxFixedCodes"] = data["maxFixedCodes"]
         if "hostname" in data:
             self._config["hostname"] = data["hostname"]
             self._deviceName = data["hostname"]
@@ -731,7 +945,7 @@ class ESPSomfyAPI:
 
     async def load_shades(self) -> Any | None:
         """Load all the shades from the controller."""
-        async with self._session.get(f"{self._api_url}{API_SHADES}") as resp:
+        async with self._session.get(f"{self._api_url}{API_SHADES}", headers=self._headers) as resp:
             if resp.status == 200:
                 self._config["shades"] = await resp.json()
                 return self._config["shades"]
@@ -739,10 +953,18 @@ class ESPSomfyAPI:
 
     async def load_groups(self) -> Any | None:
         """Load all the groups from the controller."""
-        async with self._session.get(f"{self._api_url}{API_GROUPS}") as resp:
+        async with self._session.get(f"{self._api_url}{API_GROUPS}", headers=self._headers) as resp:
             if resp.status == 200:
                 self._config["groups"] = await resp.json()
                 return self._config["groups"]
+            _LOGGER.error(await resp.text())
+
+    async def load_fixed_codes(self) -> Any | None:
+        """Load all fixed-code RF switches from the controller."""
+        async with self._session.get(f"{self._api_url}{API_FIXEDCODES}", headers=self._headers) as resp:
+            if resp.status == 200:
+                self._config["fixedCodes"] = await resp.json()
+                return self._config["fixedCodes"]
             _LOGGER.error(await resp.text())
 
     async def tilt_open(self, shade_id: int):
@@ -786,10 +1008,9 @@ class ESPSomfyAPI:
         """Sent the command to toggle."""
         await self.shade_command({"shadeId": shade_id, "command": "toggle"})
 
-    async def stop_shade(self, shade_id: int):
-        """Send the command to stop the shade."""
-        # print(f"STOP ShadeId:{shade_id}")
-        await self.shade_command({"shadeId": shade_id, "command": "my"})
+    async def stop_shade(self, shade_id: int) -> bool:
+        """Send RF stop (never favorite / My-when-idle)."""
+        return await self.shade_command({"shadeId": shade_id, "command": "stop"})
 
     async def open_group(self, group_id: int):
         """Send the command to open the group."""
@@ -799,9 +1020,9 @@ class ESPSomfyAPI:
         """Send the command to close the group."""
         await self.group_command({"groupId": group_id, "command": "down"})
 
-    async def stop_group(self, group_id: int):
-        """Send the command to stop the group."""
-        await self.group_command({"groupId": group_id, "command": "my"})
+    async def stop_group(self, group_id: int) -> bool:
+        """Send RF stop for the group (never favorite)."""
+        return await self.group_command({"groupId": group_id, "command": "stop"})
 
     async def position_shade(self, shade_id: int, position: int):
         """Send the command to position the shade."""
@@ -815,19 +1036,82 @@ class ESPSomfyAPI:
 
     async def shade_command(self, data):
         """Send commands to ESPSomfyRTS via PUT request."""
-        await self.put_command(API_SHADECOMMAND, data)
+        return await self.put_command(API_SHADECOMMAND, data)
 
-    async def set_current_position(self, shade_id: int, position: int):
-        """Set the current position without moving the motor."""
-        await self.put_command(
-            API_SETPOSITIONS, {"shadeId": shade_id, "position": position}
-        )
+    async def _fixed_code_command(self, switch_id: int, state: str) -> bool:
+        """Transmit fixed-code ON/OFF/toggle (firmware may 429 if too frequent)."""
+        return await self.put_command(API_FIXEDCODECOMMAND, {"id": switch_id, "state": state})
 
-    async def set_current_tilt_position(self, shade_id: int, tilt_position: int):
-        """Set the current tilt position without moving the motor."""
-        await self.put_command(
-            API_SETPOSITIONS, {"shadeId": shade_id, "tiltPosition": tilt_position}
-        )
+    async def fixed_code_on(self, switch_id: int) -> bool:
+        """Transmit ON for a fixed-code RF switch."""
+        return await self._fixed_code_command(switch_id, "on")
+
+    async def fixed_code_off(self, switch_id: int) -> bool:
+        """Transmit OFF for a fixed-code RF switch."""
+        return await self._fixed_code_command(switch_id, "off")
+
+    async def fixed_code_toggle(self, switch_id: int) -> bool:
+        """Transmit toggle for a single-button fixed-code RF switch."""
+        return await self._fixed_code_command(switch_id, "toggle")
+
+    async def update_fixed_code_settings(
+        self, switch_id: int, settings: dict[str, Any]
+    ) -> bool:
+        """Update FixedCode settings on the ESP (invert / single-button)."""
+        payload = {"id": switch_id, **settings}
+        async with self._session.put(
+            f"{self._api_url}{API_SAVEFIXEDCODE}", json=payload, headers=self._headers
+        ) as resp:
+            text = await resp.text()
+            body: Any = text
+            with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+                if text:
+                    body = json.loads(text)
+            ok = self._log_command_result(API_SAVEFIXEDCODE, payload, resp.status, body)
+            if ok and isinstance(body, dict) and body.get("id"):
+                codes = list(self.fixed_codes or [])
+                for i, fc in enumerate(codes):
+                    if int(fc.get("id", -1)) == switch_id:
+                        codes[i] = {**fc, **body}
+                        break
+                else:
+                    codes.append(body)
+                self._config["fixedCodes"] = codes
+            return ok
+
+    async def set_current_position(self, shade_id: int, position: int) -> bool:
+        """Set the current position without moving the motor; merge device ACK."""
+        payload = {"shadeId": shade_id, "position": position}
+        async with self._session.put(
+            f"{self._api_url}{API_SETPOSITIONS}", json=payload, headers=self._headers
+        ) as resp:
+            text = await resp.text()
+            body: Any = text
+            with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+                if text:
+                    body = json.loads(text)
+            ok = self._log_command_result(API_SETPOSITIONS, payload, resp.status, body)
+            if ok and isinstance(body, dict):
+                self.merge_shade_state(body)
+            return ok
+
+    async def set_current_tilt_position(
+        self, shade_id: int, tilt_position: int
+    ) -> bool:
+        """Set the current tilt position without moving the motor; merge device ACK."""
+        payload = {"shadeId": shade_id, "tiltPosition": tilt_position}
+        async with self._session.put(
+            f"{self._api_url}{API_SETPOSITIONS}", json=payload, headers=self._headers
+        ) as resp:
+            text = await resp.text()
+            body: Any = text
+            with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+                if text:
+                    body = json.loads(text)
+            ok = self._log_command_result(API_SETPOSITIONS, payload, resp.status, body)
+            if ok and isinstance(body, dict):
+                self.merge_shade_state(body)
+            return ok
 
     async def set_sunny(self, shade_id: int, sunny: bool):
         """Set the sunny condition for the motor."""
@@ -837,64 +1121,175 @@ class ESPSomfyAPI:
         """Set the windy condition for the motor."""
         await self.put_command(API_SETSENSOR, {"shadeId": shade_id, "windy": windy})
 
+    def _log_command_result(self, endpoint: str, data: dict, status: int, body: Any) -> bool:
+        """Interpret device ACK; return False if command was not accepted."""
+        if status == 409 or (
+            isinstance(body, dict) and body.get("cmdStatus") == "busy"
+        ):
+            desc = body.get("desc") if isinstance(body, dict) else None
+            _LOGGER.warning(
+                "Device rejected %s %s (busy%s)",
+                endpoint,
+                data,
+                f": {desc}" if desc else "",
+            )
+            return False
+        if status == 429 or (
+            isinstance(body, dict)
+            and (
+                body.get("ok") is False
+                or body.get("cmdStatus") == "rate_limited"
+            )
+        ):
+            retry = None
+            if isinstance(body, dict):
+                retry = body.get("retryAfterMs")
+            _LOGGER.warning(
+                "Device rejected %s %s (HTTP %s, rate_limited%s)",
+                endpoint,
+                data,
+                status,
+                f", retry_after_ms={retry}" if retry is not None else "",
+            )
+            return False
+        if status != 200:
+            _LOGGER.error("Device error on %s %s: HTTP %s %s", endpoint, data, status, body)
+            return False
+        if isinstance(body, dict) and body.get("ok") is False:
+            _LOGGER.warning("Device reported failure on %s %s: %s", endpoint, data, body)
+            return False
+        return True
+
     async def put_command(self, command, data):
-        """Send a put command to the device."""
-        async with self._session.put(f"{self._api_url}{command}", json=data) as resp:
-            if resp.status == 200:
-                pass
-            else:
-                _LOGGER.error(await resp.text())
+        """Send a put command to the device and honor ok/rate_limited ACK.
+
+        Radio TX on the ESP is blocking; one lock so multi-cover Close all get
+        through.
+        """
+        async with self._radio_lock:
+            async with self._session.put(
+                f"{self._api_url}{command}", json=data, headers=self._headers
+            ) as resp:
+                text = await resp.text()
+                body: Any = text
+                with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+                    if text:
+                        body = json.loads(text)
+                ok = self._log_command_result(command, data, resp.status, body)
+                # Shade command ACK includes live position/direction — merge so HA
+                # does not keep animating until the next WebSocket shadeState.
+                if (
+                    ok
+                    and command == API_SHADECOMMAND
+                    and isinstance(body, dict)
+                    and body.get("shadeId") is not None
+                ):
+                    merged = dict(body)
+                    if str(data.get("command", "")).lower() == "stop":
+                        merged["direction"] = 0
+                        merged["tiltDirection"] = 0
+                        if "position" in merged:
+                            merged["target"] = merged["position"]
+                        if "tiltPosition" in merged:
+                            merged["tiltTarget"] = merged["tiltPosition"]
+                    self.merge_shade_state(merged)
+                return ok
+
+    def get_fixed_code(self, switch_id: int) -> dict[str, Any] | None:
+        """Return cached fixed-code switch dict by id."""
+        for fc in self.fixed_codes or []:
+            try:
+                if int(fc.get("id", -1)) == int(switch_id):
+                    return fc
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def update_shade_settings(
+        self, shade_id: int, settings: dict[str, Any]
+    ) -> bool:
+        """Update shade config on the device (invert / travel times).
+
+        ESP stops any in-progress move, then applies settings. ESP is source of
+        truth; HA must not also invert commands/positions.
+        """
+        payload = {"shadeId": shade_id, **settings}
+        async with self._session.put(
+            f"{self._api_url}{API_SHADE}", json=payload, headers=self._headers
+        ) as resp:
+            text = await resp.text()
+            body: Any = text
+            with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+                if text:
+                    body = json.loads(text)
+            ok = self._log_command_result(API_SHADE, payload, resp.status, body)
+            if ok and isinstance(body, dict):
+                self.merge_shade_state(body)
+                if body.get("stoppedMove"):
+                    _LOGGER.info(
+                        "Stopped shade %s before applying settings %s",
+                        shade_id,
+                        list(settings),
+                    )
+            return ok
 
     async def login(self, data):
-        """Log in to the EPSSomfy hardware device."""
-        if self._canLogin:
-            async with self._session.put(
-                f"{self._api_url}{API_LOGIN}", json=data
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("success"):
-                        if "apiKey" in data:
-                            self._config["apiKey"] = self._headers["apikey"] = data[
-                                "apiKey"
-                            ]
-                    else:
-                        if "type" in data:
-                            if data["type"] == 1:
-                                raise LoginError(CONF_PIN, "invalid_pin")
-                            if data["type"] == 2:
-                                raise LoginError(CONF_USERNAME, "invalid_password")
-                        raise LoginError(CONF_HOST, "invalid_login")
-
-                else:
-                    _LOGGER.error("Error logging in: %s", await resp.text())
-                    raise LoginError(f"{self._api_url} - {await resp.text()}")
+        """Log in to the ESPSomfy hardware device."""
+        async with self._session.put(
+            f"{self._api_url}{API_LOGIN}", json=data
+        ) as resp:
+            if resp.status != 200:
+                _LOGGER.error("Error logging in: %s", await resp.text())
+                raise LoginError(CONF_HOST, "login_error")
+            data = await resp.json()
+            if data.get("success"):
+                if "apiKey" in data:
+                    self._config["apiKey"] = self._headers["apikey"] = data["apiKey"]
+                return
+            if data.get("type") == 1:
+                raise LoginError(CONF_PIN, "invalid_pin")
+            if data.get("type") == 2:
+                raise LoginError(CONF_USERNAME, "invalid_password")
+            raise LoginError(CONF_HOST, "invalid_login")
 
     async def group_command(self, data):
         """Send commands to ESPSomfyRTS via PUT request."""
-        async with self._session.put(
-            f"{self._api_url}{API_GROUPCOMMAND}", json=data
-        ) as resp:
-            if resp.status == 200:
-                pass
-            else:
-                _LOGGER.error(await resp.text())
+        return await self.put_command(API_GROUPCOMMAND, data)
+
+    async def room_command(self, room_id: int, command: str):
+        """Open/close/my/stop every shade in a room (queued on the ESP)."""
+        cmd = str(command or "").lower()
+        if cmd == "open":
+            cmd = "up"
+        elif cmd == "close":
+            cmd = "down"
+        return await self.put_command(
+            API_ROOMCOMMAND, {"roomId": int(room_id), "command": cmd}
+        )
+
+    async def scene_command(self, scene_id: int):
+        """Apply a named scene stored on the controller."""
+        return await self.put_command(API_SCENECOMMAND, {"id": int(scene_id)})
 
     async def tilt_command(self, data):
         """Send tilt commands to ESPSomfyRTS via PUT request."""
-        async with self._session.put(
-            f"{self._api_url}{API_TILTCOMMAND}", json=data
-        ) as resp:
-            if resp.status == 200:
-                pass
-            else:
-                _LOGGER.error(await resp.text())
+        return await self.put_command(API_TILTCOMMAND, data)
 
     async def get_initial(self):
         """Get the initial config from ESPSomfy RTS."""
         try:
             self._session = aiohttp_client.async_get_clientsession(self.hass)
-            async with self._session.get(f"{self._api_url}{API_DISCOVERY}") as resp:
+            creds = {
+                "username": self.data.get(CONF_USERNAME, ""),
+                "password": self.data.get(CONF_PASSWORD, ""),
+                "pin": self.data.get(CONF_PIN, ""),
+            }
+            if any(creds.values()):
+                with contextlib.suppress(LoginError, aiohttp.ClientError):
+                    await self.login(creds)
+            async with self._session.get(
+                f"{self._api_url}{API_DISCOVERY}", headers=self._headers
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.apply_data(data)

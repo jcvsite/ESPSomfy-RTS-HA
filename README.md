@@ -1,137 +1,161 @@
 # ESPSomfy RTS — Home Assistant
 
-Fork of [rstrouse/ESPSomfy-RTS-HA](https://github.com/rstrouse/ESPSomfy-RTS-HA). **This is the recommended Home Assistant integration** for the [community ESPSomfy-RTS firmware](https://github.com/jcvsite/ESPSomfy-RTS). Same REST **:8081** + WebSocket **:8080** controller, with invert, travel times, calibrate, cover pictures, and fixed-code RF switches.
+<p align="center">
+  <img src="images/logo.png" alt="ESPSomfy RTS" width="280"/>
+</p>
 
-The original HA component still does open / stop / close. Use this fork instead — it is the improved version and matches the forked firmware.
+**Home Assistant integration for the [jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) firmware fork.**  
+It is **not** a drop-in for stock [rstrouse](https://github.com/rstrouse/ESPSomfy-RTS) firmware — pair both sides of this community stack.
 
-[![GitHub Release](https://img.shields.io/github/release/jcvsite/ESPSomfy-RTS-HA.svg?style=for-the-badge)](https://github.com/jcvsite/ESPSomfy-RTS-HA/releases)
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
-[![License](https://img.shields.io/github/license/jcvsite/ESPSomfy-RTS-HA.svg?style=for-the-badge)](LICENSE)
+[![Integration](https://img.shields.io/github/v/release/jcvsite/ESPSomfy-RTS-HA?style=for-the-badge&label=Integration)](https://github.com/jcvsite/ESPSomfy-RTS-HA/releases)
+[![Firmware](https://img.shields.io/github/v/release/jcvsite/ESPSomfy-RTS?style=for-the-badge&label=Required%20firmware)](https://github.com/jcvsite/ESPSomfy-RTS/releases)
+[![HACS](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
+[![License](https://img.shields.io/github/license/jcvsite/ESPSomfy-RTS-HA?style=for-the-badge)](LICENSE)
 
-Integration **v2.6.1**. Details: [CHANGELOG.md](CHANGELOG.md). Requires firmware **[jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) v3.4.5+** (room covers / scenes: **v3.4.0+**).
+**Current:** integration **v2.6.1** · requires firmware **[jcvsite/ESPSomfy-RTS v3.4.5+](https://github.com/jcvsite/ESPSomfy-RTS)** · [CHANGELOG](CHANGELOG.md)
 
-**Repository:** [github.com/jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA)
+![Required firmware pairing](images/ha-firmware-pairing.png)
 
-## What changed vs the original
+> **Use together**
+> | Component | Repo | Version |
+> |---|---|---|
+> | Firmware (ESP32) | [jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) | **v3.4.5+** |
+> | This integration | [jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA) | **v2.6.1+** |
+>
+> Do **not** mix with stock rstrouse firmware or the stock HA component if you want invert, calibrate, room covers, scenes, cover pictures, or FixedCode switches.
 
-| | Original HA | This fork |
+---
+
+## Quick start
+
+![Install steps](images/ha-install-steps.png)
+
+### 1. Flash the matching firmware first
+
+1. Install **[jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) v3.4.5+** on your ESP32.  
+2. New board or coming from another fork → **USB onboard image** (see the [firmware README](https://github.com/jcvsite/ESPSomfy-RTS#flash-a-new-device)).  
+3. Confirm the web UI shows **v3.4.5** (or newer) and that shades are paired.
+
+### 2. Install this integration (HACS)
+
+1. HACS → **⋯** → **Custom repositories**
+2. URL: `https://github.com/jcvsite/ESPSomfy-RTS-HA`
+3. Category: **Integration**
+4. Download **ESPSomfy RTS** → **restart Home Assistant**
+
+### 3. Add the hub
+
+1. **Settings → Devices & Services → Add integration**
+2. Search **ESPSomfy RTS** (or accept discovery via mDNS / SSDP)
+3. Enter host / login if prompted (same credentials as the device web UI)
+
+### Manual install (without HACS)
+
+Copy `custom_components/espsomfy_rts` into your HA `config/custom_components/` folder, restart, then add the integration as above.
+
+---
+
+## What you get
+
+| | Stock HA (rstrouse) | This fork |
 |---|---|---|
 | Open / Stop / Close | Yes | Yes |
-| Position scale | Motor-native | **100% open / 0% closed** (same as the device UI and HA covers) |
-| Stop while moving | `my` (can go to favorite) | API **`stop`** — actually stops |
-| Invert / travel / calibrate | No (or HA-only) | Config entities **synced to the ESP** |
-| Cover pictures | Generic MDI | Type + open / partial / closed graphics (curtain, blind, shutter, awning, garage, gate) |
-| Entity names | Often `Room-Name` | Device name only; room is a suggested HA area |
-| Room covers | No | **One cover per room** (Open / Stop / Close, queued on the ESP) |
-| Scenes | No | Service **`apply_scene`** (scenes are saved on the controller) |
-| Fixed-code RF switches | No | Yes (learn / TX 433 MHz ON/OFF) |
-| Required firmware | stock ESPSomfy-RTS | [jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) |
+| Position scale | Motor-native | **100% open / 0% closed** |
+| Stop while moving | `my` (may go to favorite) | API **`stop`** (actually stops) |
+| Invert / travel / calibrate | Limited / HA-only | **Synced to the ESP** |
+| Cover pictures | Generic MDI | Curtain, blind, shutter, awning, garage, gate |
+| Entity names | Often `Room-Name` | Device name; room = suggested **area** |
+| Room covers | No | **One cover per room** (queued RF) |
+| Scenes | No | Service **`apply_scene`** |
+| Fixed-code RF switches | No | Learn / TX 433 MHz ON/OFF |
+| **Firmware** | Stock ESPSomfy-RTS | **[jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) only** |
 
-Unchanged: mDNS/SSDP discovery, shade/group/sun/dry-contact entities, and the original wiki for first-time pairing. Shade services and events are documented in the [upstream README](https://github.com/rstrouse/ESPSomfy-RTS-HA).
+![Cover picture types](images/ha-cover-types.png)
 
-## Requirements
+Unchanged: mDNS/SSDP discovery, shade/group/sun/dry-contact entities. Upstream services/events: [rstrouse README](https://github.com/rstrouse/ESPSomfy-RTS-HA).
 
-- ESP32 + CC1101 running the [community firmware](https://github.com/jcvsite/ESPSomfy-RTS)
-- Home Assistant with HACS, or a manual `custom_components` install
+---
 
-Do not mix this integration with stock firmware, or stock HA with this firmware, if you want invert, calibrate, pictures, or RF switches.
+## Day-to-day use
 
-## Installation
+### Naming & rooms
 
-Copy `custom_components/espsomfy_rts` into your HA `config/custom_components/` directory (or add this repo as a HACS custom repository), then restart Home Assistant.
+- Entity names = **device name** from the controller (not `Room-Shade`).
+- Room on the ESP becomes a Home Assistant **suggested area**.
+- After renaming or moving rooms on the device, **reload** the integration.
 
-Configure the device under **Settings → Devices & Services** (auto-discovery via mDNS/SSDP still works).
+### Covers
 
-After adding or learning RF switches on the controller web UI, **reload the ESPSomfy RTS integration** so new switch entities appear.
+Each shade cover has Open / Stop / Close, a position slider, and type-based pictures (open / partial / closed).
 
-**MQTT-only alternative:** if MQTT discovery is enabled on the controller, RF switches can appear as MQTT `switch` entities without this custom component. This fork is for the native ESPSomfy HA integration.
+**Calibrate position** (Configuration) only corrects the reported % — it does **not** move the motor.
 
-## Entity naming and rooms
+### Buttons never swap
 
-Shades, groups, and related entities use the **device name only** (as set on the controller). The room is applied as a Home Assistant **suggested area**, not as a name prefix.
+HA always shows **Open / Stop / Close**. Invert changes RF / % on the ESP, not the button labels.
 
-Reload the integration after changing names or rooms. Existing entity IDs may be rewritten to match the bare device name when possible.
-
-## Cover visuals and position
-
-Each shade cover shows:
-
-- **Open / Stop / Close** plus a **position slider** (move the motor)
-- An **icon and window picture** that change with shade type (curtain, blind, roller, shutter, awning, garage, gate) and open / partial / closed — similar to the Somfy web UI
-- **Calibrate position** (Configuration) — a **slider** that only updates the reported % (no motor move). Use when the curtain is open in reality but HA says closed.
-
-## Shade settings (synced with the controller)
-
-Pair motors and do first-time setup in the ESPSomfy web UI. After that, these config entities on each shade device stay in sync with the controller.
-
-### Remote layout (never changes)
-
-HA always shows **Open / Stop / Close** (same as Up / Stop / Down on a Somfy remote):
-
-| Button | Meaning | HA → ESP command |
-|---|---|---|
-| **Open** | Open the shade | `up` |
-| **Stop** | Stop | `stop` (while moving) / `my` |
-| **Close** | Close the shade | `down` |
-
-The button layout does **not** swap when you invert. Only the underlying RF (and/or position scale) on the ESP changes.
-
-### Invert switches
-
-| HA entity | ESP setting | What it fixes |
-|---|---|---|
-| **Invert open/close** | `flipCommands` | Open was closing / Close was opening **and** status showed the wrong opening/closing. ESP swaps RF Up↔Down. HA still sends Open=`up`, Close=`down`. |
-| **Invert position scale** | `flipPosition` | Open/closed **percentage** still wrong after open/close is correct. |
-| **Full open / close time** | `upTime` / `downTime` | Travel time in seconds (HA) ↔ ms (ESP). |
-
-**Keep them independent — do not auto-link.**
-
-| Symptom | Use |
+| Symptom | Fix |
 |---|---|
-| Open closes + UI shows **closing** | **Invert open/close** only |
+| Open closes the shade (and shows “closing”) | Turn on **Invert open/close** |
 | % still wrong when fully open/closed | Then **Invert position scale** |
 
-### Opening / closing text vs position %
+Keep those two settings **independent**. Details and edge cases are below under [Invert & travel times](#invert--travel-times).
 
-These are different signals from the ESP:
+### Rooms & scenes
 
-- **Opening / closing / stopped** ← movement `direction` (`-1` / `+1` / `0`), driven by Open/Close/Stop
-- **How far open (0–100%)** ← `position` (HA cover always uses 100 = open, 0 = closed)
+- **Room cover** — Open / Stop / Close for every shade in that room (firmware RF queue).
+- Services: `espsomfy_rts.apply_scene`, `espsomfy_rts.room_command`  
+  Use `host=` if you have more than one hub.
 
-So **position is not the same thing as opening/closing direction**. Invert direction fixes which way the motor runs when you press Open/Close. Invert position adjusts the % scale if that reading is backwards.
+### RF switches
 
-### Your typical fix (reversed open/close + wrong status)
+Learn ON/OFF codes on the **controller web UI**, then **reload** this integration so switch entities appear.
 
-> Open closed the shade, and while it moved the UI showed **closing** instead of **opening**.
+- Unavailable until codes are learned (`ready`)
+- Optional: **Invert ON/OFF**, **Single-button remote**
+- MQTT discovery can also expose switches without this component — this repo is for the **native** integration
 
-That is one setting in HA:
+---
 
-1. Open the shade device → **Configuration**
-2. Turn on **Invert open/close** (writes `flipCommands` to the ESP)
-3. Press **Open** — motor should open and status should show **opening**
-4. Leave **Invert position scale** off unless the 0–100% reading is still wrong when fully open/closed
+## Invert & travel times
 
-Buttons stay **Open / Stop / Close**. Only the ESP RF mapping changes.
+Synced config entities on each shade device (after motors are paired in the ESP UI):
 
-You can change these anytime. If the shade is moving, the controller **stops it first**, then saves. Somfy UI and HA stay in sync over the WebSocket.
+| HA entity | ESP field | Purpose |
+|---|---|---|
+| Invert open/close | `flipCommands` | Swaps RF Up↔Down |
+| Invert position scale | `flipPosition` | Fixes 0–100% if still backwards |
+| Full open / close time | `upTime` / `downTime` | Travel time (HA seconds ↔ ESP ms) |
 
-## RF switch behaviour
+**Opening/closing** (direction) and **position %** are separate signals. Fix direction first; only then tweak %.
 
-- Entities are HA `switch` devices named from the controller
-- Unavailable until ON/OFF codes are learned (`ready`)
-- Single-button remotes use toggle TX for both ON and OFF
-- State is software-tracked after transmit (no RF feedback)
-- Anti-spam matches firmware (1.5 s same command, 0.4 s ON↔OFF reverse)
-- Configuration (synced to ESP):
-  - **Invert ON/OFF** — when On turns the device Off
-  - **Single-button remote** — on = one learned code; off = use both ON and OFF codes
+If the shade is moving when you change a setting, the controller **stops it**, then saves. Somfy UI and HA stay in sync over the WebSocket.
 
-## Firmware
-
-Use **[jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) v3.4.5+**. First install from the original or another firmware fork needs a **USB / full flash** (new partition map) — see the firmware README. Hardware, pairing, and MQTT basics remain in the [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki).
+---
 
 ## Alexa / voice
 
-Expose this integration’s `cover` entities via **Home Assistant Cloud** Alexa (or a manual Alexa Smart Home skill), then discover devices in the Alexa app. Device class (blind/shade/curtain vs shutter/awning) controls Interior vs Exterior Blind in Alexa.
+- **With Home Assistant (recommended):** expose `cover.*` via HA Cloud Alexa (or a skill), then discover devices. Device class maps to Interior / Exterior Blind.
+- **Without HA:** firmware **Network → Alexa** (Hue bridge) — shades appear as lights. Don’t mix Hue bridge and HA Alexa on the same motors. See the [firmware README](https://github.com/jcvsite/ESPSomfy-RTS).
 
-If you do **not** use Home Assistant, the firmware can optionally run a **fake Philips Hue bridge** on the Router (**Network → Alexa**: master toggle + shade list). Those appear as lights (“turn on” / brightness), not as blinds — see the firmware README.
+---
+
+## Requirements checklist
+
+- [ ] ESP32 + CC1101 on **[jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS) v3.4.5+** (not stock firmware)
+- [ ] Home Assistant **2024.6+** (see `hacs.json`)
+- [ ] This integration **v2.6.1+** via HACS or manual copy
+- [ ] Hub reachable on LAN (REST `:8081`, WebSocket `:8080`)
+
+Hardware wiring & Somfy pairing: [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki).
+
+---
+
+## Links
+
+| | |
+|---|---|
+| Firmware (required) | https://github.com/jcvsite/ESPSomfy-RTS |
+| This integration | https://github.com/jcvsite/ESPSomfy-RTS-HA |
+| Upstream HA (stock) | https://github.com/rstrouse/ESPSomfy-RTS-HA |
+| Changelog | [CHANGELOG.md](CHANGELOG.md) |
